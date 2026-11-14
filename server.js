@@ -20,6 +20,8 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const MAX_TALK_MS = (+process.env.MAX_TALK_SEC || 60) * 1000;
 const PUSH_CONTACT = process.env.PUSH_CONTACT || 'mailto:admin@example.com';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const MAX_RECS = 10;                                   // הקלטות אחרונות לכל ערוץ
+const MAX_REC_BYTES = Math.ceil(MAX_TALK_MS / 1000 + 2) * 32000;
 
 if (!process.env.ADMIN_PASSWORD) {
   console.warn('⚠️  ADMIN_PASSWORD לא הוגדר – משתמשים בסיסמת ברירת מחדל "admin1234". מומלץ לשנות!');
@@ -31,6 +33,7 @@ function newId(p) { return p + crypto.randomBytes(5).toString('hex'); }
 // אחסון: אם הוגדר DATABASE_URL (Postgres, למשל Neon בחינם) – הנתונים נשמרים שם; אחרת בקובץ
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let pgPool = null;
+const recs = new Map();   // channelId -> [{ id, channel, name, start, end, lat, lng, acc, audio: Buffer }] (החדש ראשון)
 let db = { users: {}, channels: {}, tokens: {}, vapid: null, adminLoc: null, adminPush: [], alerts: [] };
 
 async function loadDb() {
@@ -41,6 +44,13 @@ async function loadDb() {
     await pgPool.query('CREATE TABLE IF NOT EXISTS kesher_store (k TEXT PRIMARY KEY, v JSONB NOT NULL, updated TIMESTAMPTZ DEFAULT now())');
     const r = await pgPool.query("SELECT v FROM kesher_store WHERE k = 'db'");
     if (r.rows[0]) loaded = r.rows[0].v;
+    await pgPool.query('CREATE TABLE IF NOT EXISTS kesher_rec (id TEXT PRIMARY KEY, channel TEXT NOT NULL, meta JSONB NOT NULL, audio BYTEA NOT NULL, ts BIGINT NOT NULL)');
+    const rr = await pgPool.query('SELECT id, channel, meta, audio FROM kesher_rec ORDER BY ts DESC');
+    for (const row of rr.rows) {
+      const list = recs.get(row.channel) || [];
+      if (list.length < MAX_RECS) list.push(Object.assign({}, row.meta, { id: row.id, channel: row.channel, audio: row.audio }));
+      recs.set(row.channel, list);
+    }
     console.log('💾 אחסון: Postgres');
   } else {
     try { loaded = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { /* קובץ חדש */ }
@@ -97,7 +107,13 @@ const MIME = {
 const server = http.createServer((req, res) => {
   let p;
   try { p = decodeURIComponent((req.url || '/').split('?')[0]); } catch { res.writeHead(400); return res.end(); }
-  if (p === '/health') { res.writeHead(200); return res.end('ok'); }
+  if (p === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
+  if (p === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ ok: true, storage: pgPool ? 'postgres' : 'file', online: [...sessions].filter(x => x.name).length, lastTx }));
+  }
+  const rm = p.match(/^\/rec\/([a-z0-9]+)$/);
+  if (rm) return serveRec(req, res, rm[1]);
   if (p === '/') p = '/index.html';
   const f = path.normalize(path.join(PUBLIC_DIR, p));
   if (!f.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end(); }
@@ -113,7 +129,8 @@ const server = http.createServer((req, res) => {
 // ---------------------------------------------------------------- WebSocket
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
 const sessions = new Set();
-const floors = new Map(); // channelId -> { s, entry, timer }
+const floors = new Map(); // channelId -> { s, entry, timer, chunks, bytes, peak, sent }
+let lastTx = null;        // אבחון: נתוני השידור האחרון
 const log = [];           // יומן שידורים (בזיכרון)
 
 function send(s, obj) { if (s.ws.readyState === 1) s.ws.send(JSON.stringify(obj)); }
@@ -156,11 +173,58 @@ function onAudio(s, data) {
   if (!s.speaking) return;
   const f = floors.get(s.speaking);
   if (!f || f.s !== s) return;
+  if (f.bytes + data.length <= MAX_REC_BYTES) { f.chunks.push(Buffer.from(data)); f.bytes += data.length; }
+  for (let i = 0; i + 1 < data.length; i += 8) { const v = Math.abs(data.readInt16LE(i)); if (v > f.peak) f.peak = v; }
+  let n = 0;
   for (const o of sessions) {
     if (o !== s && o.name && o.active === s.speaking && o.ws.readyState === 1 && o.ws.bufferedAmount < 512 * 1024) {
-      o.ws.send(data, { binary: true });
+      o.ws.send(data, { binary: true }); n++;
     }
   }
+  f.sent += n; f.frames++; if (n > f.maxListeners) f.maxListeners = n;
+}
+
+// ---------------------------------------------------------------- הקלטות
+function recMeta(r) {
+  return { id: r.id, channel: r.channel, name: r.name, start: r.start, end: r.end, dur: Math.round(r.audio.length / 32) / 1000, lat: r.lat, lng: r.lng, acc: r.acc };
+}
+function saveRec(f) {
+  const e = f.entry;
+  const r = { id: e.id, channel: e.channel, name: e.name, start: e.start, end: e.end, lat: e.lat, lng: e.lng, acc: e.acc, audio: Buffer.concat(f.chunks) };
+  const list = recs.get(e.channel) || [];
+  list.unshift(r);
+  const removed = list.splice(MAX_RECS);
+  recs.set(e.channel, list);
+  e.hasRec = true;
+  if (pgPool) {
+    const { audio, ...meta } = r;
+    pgPool.query('INSERT INTO kesher_rec (id, channel, meta, audio, ts) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING', [r.id, r.channel, JSON.stringify(meta), audio, r.start])
+      .then(() => removed.length && pgPool.query('DELETE FROM kesher_rec WHERE id = ANY($1)', [removed.map(x => x.id)]))
+      .catch(err => console.error('rec save failed', err.message));
+  }
+  for (const o of sessions) if (o.name && (o.active === e.channel || o.role === 'admin')) send(o, { t: 'recs_changed', channel: e.channel });
+}
+function findRec(id) {
+  for (const list of recs.values()) { const r = list.find(x => x.id === id); if (r) return r; }
+  return null;
+}
+function wavHeader(len) {
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + len, 4); h.write('WAVE', 8);
+  h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(16000, 24); h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write('data', 36); h.writeUInt32LE(len, 40);
+  return h;
+}
+function serveRec(req, res, id) {
+  const auth = String(req.headers.authorization || '');
+  const tk = db.tokens[auth.replace(/^Bearer\s+/i, '')];
+  const r = findRec(id);
+  const ok = tk && r && (tk.role === 'admin' || (db.users[tk.name] && !db.users[tk.name].blocked && db.users[tk.name].channels.includes(r.channel)));
+  if (!tk) { res.writeHead(401); return res.end(); }
+  if (!ok) { res.writeHead(404); return res.end(); }
+  res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': 44 + r.audio.length, 'Cache-Control': 'private, max-age=3600' });
+  res.end(Buffer.concat([wavHeader(r.audio.length), r.audio]));
 }
 
 function releaseFloor(ch) {
@@ -170,6 +234,8 @@ function releaseFloor(ch) {
   floors.delete(ch);
   f.s.speaking = null;
   f.entry.end = Date.now();
+  lastTx = { at: f.entry.end, ms: f.entry.end - f.entry.start, frames: f.frames, bytes: f.bytes, peak: f.peak, listeners: f.maxListeners, forwarded: f.sent };
+  if (f.bytes >= 3200) saveRec(f); // לפחות 0.1 שניות
   for (const o of sessions) if (o !== f.s && o.name && o.active === ch) send(o, { t: 'speaking_end', channel: ch, name: f.s.name });
   toAdmins({ t: 'speak_end', entry: f.entry });
 }
@@ -230,7 +296,7 @@ function onMsg(s, m) {
       log.unshift(entry);
       if (log.length > 300) log.pop();
       floors.set(ch, {
-        s, entry,
+        s, entry, chunks: [], bytes: 0, peak: 0, sent: 0, frames: 0, maxListeners: 0,
         timer: setTimeout(() => { send(s, { t: 'floor_timeout', msg: 'הגעת למגבלת זמן השידור' }); releaseFloor(ch); }, MAX_TALK_MS),
       });
       s.speaking = ch;
@@ -249,6 +315,11 @@ function onMsg(s, m) {
       if (list.length > 5) list.splice(0, list.length - 5);
       save();
       return broadcastAll();
+    }
+    case 'recs': {
+      const ch = m.channel;
+      if (!ch || !allowedChannels(s).includes(ch)) return;
+      return send(s, { t: 'recs', channel: ch, list: (recs.get(ch) || []).map(recMeta) });
     }
     case 'alert_ack': {
       const a = db.alerts.find(x => x.id === m.id);
@@ -429,6 +500,8 @@ function adminOp(s, m) {
       if (!db.channels[m.id]) return;
       releaseFloor(m.id);
       delete db.channels[m.id];
+      recs.delete(m.id);
+      if (pgPool) pgPool.query('DELETE FROM kesher_rec WHERE channel = $1', [m.id]).catch(() => {});
       for (const x of Object.values(db.users)) x.channels = x.channels.filter(c => c !== m.id);
       for (const o of sessions) if (o.active === m.id) o.active = allowedChannels(o)[0] || null;
       break;

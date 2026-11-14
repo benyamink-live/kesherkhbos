@@ -20,8 +20,12 @@ const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platfo
 const MIC_IDLE_MS = 20000;   // סגירת המיקרופון אחרי 20 שניות בלי שידור
 const CTX_IDLE_MS = 30000;   // השהיית מנוע השמע אחרי 30 שניות שקט
 
+function setAudioSession(type) {
+  try { if (navigator.audioSession) navigator.audioSession.type = type; } catch { /* ignore */ }
+}
 async function audioInit() {
   if (!A.ctx) {
+    setAudioSession('playback');
     A.ctx = new (window.AudioContext || window.webkitAudioContext)();
     A.out = A.ctx.createGain();
     A.out.gain.value = 1.4;
@@ -39,6 +43,7 @@ function micInit() {
 }
 async function openMic() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('הדפדפן לא תומך במיקרופון (נדרש HTTPS)'); return false; }
+  setAudioSession('play-and-record');
   try {
     A.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
   } catch (e) { toast('אין גישה למיקרופון – אשר הרשאה בדפדפן'); return false; }
@@ -72,16 +77,12 @@ function micRelease() {
   try { A.src.disconnect(); A.node.disconnect(); if (A.node.port) { A.node.port.onmessage = null; A.node.port.close(); } } catch { /* ignore */ }
   if (A.stream) A.stream.getTracks().forEach((t) => t.stop());
   A.stream = A.src = A.node = null; A.micReady = false;
+  setAudioSession('playback');
   ctxScheduleIdle();
 }
 // השהיית מנוע השמע כשאין פעילות (חוסך סוללה). באייפון לא משהים – שם אי אפשר להפעיל מחדש בלי נגיעה
-function ctxScheduleIdle() {
-  clearTimeout(A.ctxIdle);
-  if (IS_IOS) return;
-  A.ctxIdle = setTimeout(() => {
-    if (A.ctx && A.ctx.state === 'running' && !S.talking && !S.wantTalk && !S.speaking && !A.alarm && !A.micReady) A.ctx.suspend().catch(() => {});
-  }, CTX_IDLE_MS);
-}
+// מנוע השמע נשאר פעיל כדי שקול נכנס יישמע תמיד (המיקרופון עדיין נסגר כשלא מדברים)
+function ctxScheduleIdle() { clearTimeout(A.ctxIdle); }
 function ctxWake() {
   clearTimeout(A.ctxIdle);
   if (A.ctx && A.ctx.state === 'suspended') A.ctx.resume().catch(() => {});
@@ -89,6 +90,8 @@ function ctxWake() {
 
 function onMic(input) {
   if (!S.talking) { A.rsBuf = new Float32Array(0); A.rsPos = 0; A.pend = []; return; }
+  let pk = 0; for (let i = 0; i < input.length; i += 4) { const v = Math.abs(input[i]); if (v > pk) pk = v; }
+  S.txLevel = Math.max(pk, (S.txLevel || 0) * 0.85); if (pk > (S.txMax || 0)) S.txMax = pk;
   const ratio = A.ctx.sampleRate / RATE;
   const buf = new Float32Array(A.rsBuf.length + input.length);
   buf.set(A.rsBuf); buf.set(input, A.rsBuf.length);
@@ -109,13 +112,15 @@ function onMic(input) {
 function flushMic() {
   if (!A.pend.length) return;
   const a = Int16Array.from(A.pend); A.pend = [];
-  if (S.ws && S.ws.readyState === 1) S.ws.send(a.buffer);
+  if (S.ws && S.ws.readyState === 1) { S.ws.send(a.buffer); S.txBytes = (S.txBytes || 0) + a.byteLength; }
 }
 
 function playChunk(ab) {
   if (!A.ctx || A.ctx.state === 'closed' || ab.byteLength < 2) return;
   if (A.ctx.state !== 'running') ctxWake();
   const i16 = new Int16Array(ab, 0, ab.byteLength >> 1);
+  S.rxBytes = (S.rxBytes || 0) + ab.byteLength;
+  if (!S.rxShow || Date.now() - S.rxShow > 250) { S.rxShow = Date.now(); $('#diag').textContent = `📥 מקבל קול… ${Math.round(S.rxBytes / 1024)}KB${A.ctx.state !== 'running' ? ' · ⚠️ השמע מושהה – לחץ על המסך' : ''}`; }
   const b = A.ctx.createBuffer(1, i16.length, RATE);
   const d = b.getChannelData(0);
   for (let i = 0; i < i16.length; i++) d[i] = i16[i] / 32768;
@@ -197,6 +202,7 @@ function handle(m) {
       if (S.speaking !== m.speaking) A.nextTime = 0;
       S.speaking = m.speaking;
       renderTalk();
+      if (S.recsCh !== S.active) { S.recsCh = S.active; S.recs = []; renderRecs(); requestRecs(); }
       renderPushBtn();
       break;
     case 'floor':
@@ -209,12 +215,17 @@ function handle(m) {
       S.talking = false; S.wantTalk = false; toast(m.msg); stopTalkTimer(); micScheduleRelease(); renderPtt();
       break;
     case 'speaking':
-      if (m.channel === S.active) { ctxWake(); S.speaking = m.name; A.nextTime = 0; beep(700, 0.06); renderTalk(); }
+      if (m.channel === S.active) {
+        ctxWake(); S.speaking = m.name; A.nextTime = 0; S.rxBytes = 0; beep(700, 0.06); renderTalk();
+        setTimeout(() => { if (A.ctx && A.ctx.state !== 'running') $('#unlock').classList.remove('hidden'); }, 700);
+      }
       break;
     case 'speaking_end':
-      if (m.channel === S.active) { S.speaking = null; setTimeout(() => beep(480, 0.08), 250); renderTalk(); ctxScheduleIdle(); }
+      if (m.channel === S.active) { S.speaking = null; setTimeout(() => beep(480, 0.08), 250); renderTalk(); if (S.rxBytes) $('#diag').textContent = `✓ התקבלו ${Math.round(S.rxBytes / 1024)}KB`; }
       break;
     case 'toast': toast(m.msg); break;
+    case 'recs': if (m.channel === S.active) { S.recs = m.list; renderRecs(); } break;
+    case 'recs_changed': if (m.channel === S.active) requestRecs(); break;
     case 'alert': queueAlert(m.alert); break;
     // ---- מנהל
     case 'state': S.state = m; renderAdmin(); break;
@@ -249,7 +260,7 @@ async function showMain() {
 
 $('#unlockBtn').onclick = async () => {
   $('#unlock').classList.add('hidden');
-  await audioInit(); ctxScheduleIdle();
+  await audioInit();
 };
 
 $('#loginForm').addEventListener('submit', async (e) => {
@@ -330,6 +341,41 @@ function stopTalk() {
   renderPtt(); renderTalk();
 }
 
+// ---- הקלטות אחרונות
+function requestRecs() { if (S.active) send({ t: 'recs', channel: S.active }); }
+const recAudio = new Audio();
+recAudio.preload = 'auto';
+let recPlaying = null;
+recAudio.addEventListener('ended', () => { recPlaying = null; renderRecs(); });
+recAudio.addEventListener('pause', () => { if (recAudio.ended || recAudio.currentTime === 0) return; recPlaying = null; renderRecs(); });
+function renderRecs() {
+  const list = S.recs || [];
+  $('#recsList').innerHTML = list.length ? list.map((r) => `
+    <li class="${recPlaying === r.id ? 'playing' : ''}">
+      <span class="meta"><b>${esc(r.name)}${r.name === S.me ? ' <span class="muted small">(אתה)</span>' : ''}</b><small>${fmtTime(r.start)} · ${Math.max(1, Math.round(r.dur))} שנ׳</small></span>
+      <button class="play-btn" data-rec="${esc(r.id)}" aria-label="נגן">${recPlaying === r.id ? '⏹' : '▶'}</button>
+    </li>`).join('') : '<li class="muted">אין עדיין הקלטות בערוץ הזה</li>';
+}
+async function playRec(id) {
+  if (recPlaying === id) { recAudio.pause(); recPlaying = null; renderRecs(); return; }
+  try {
+    const res = await fetch('rec/' + encodeURIComponent(id), { headers: { Authorization: 'Bearer ' + S.token } });
+    if (!res.ok) { toast(res.status === 404 ? 'ההקלטה כבר לא זמינה' : 'לא ניתן לנגן כרגע'); return; }
+    const url = URL.createObjectURL(await res.blob());
+    if (recAudio.src && recAudio.src.startsWith('blob:')) URL.revokeObjectURL(recAudio.src);
+    recAudio.src = url;
+    recPlaying = id; renderRecs();
+    await recAudio.play();
+  } catch (e) { recPlaying = null; renderRecs(); toast('לא ניתן לנגן: ' + e.message); }
+}
+$('#recsList').addEventListener('click', (e) => { const b = e.target.closest('[data-rec]'); if (b) playRec(b.dataset.rec); });
+$('#testSoundBtn').addEventListener('click', async () => {
+  await audioInit();
+  $('#unlock').classList.add('hidden');
+  beep(660, 0.25, 0.3); setTimeout(() => beep(880, 0.25, 0.3), 300); setTimeout(() => beep(1100, 0.35, 0.3), 600);
+  toast(A.ctx && A.ctx.state === 'running' ? '🔊 אם שמעת 3 צפצופים – הרמקול תקין' : '⚠️ השמע חסום – נסה ללחוץ שוב');
+});
+
 const ptt = $('#pttBtn');
 ptt.addEventListener('pointerdown', (e) => {
   e.preventDefault();
@@ -352,10 +398,15 @@ document.addEventListener('keyup', (e) => { if (e.code === 'Space' && spaceDown)
 let talkTimer = null;
 function startTalkTimer() {
   stopTalkTimer();
-  const tick = () => { $('#talkTimer').textContent = `${Math.floor((Date.now() - S.talkStart) / 1000)} / ${S.maxTalk} שניות`; };
-  tick(); talkTimer = setInterval(tick, 1000);
+  S.txBytes = 0; S.txLevel = 0; S.txMax = 0;
+  const tick = () => {
+    $('#talkTimer').textContent = `${Math.floor((Date.now() - S.talkStart) / 1000)} / ${S.maxTalk} שניות`;
+    const lv = Math.min(100, Math.round((S.txLevel || 0) * 140));
+    $('#diag').innerHTML = `📤 נשלח ${Math.round((S.txBytes || 0) / 1024)}KB <span class="lvl"><i style="width:${lv}%"></i></span>${!A.micReady ? ' · פותח מיקרופון…' : (S.txBytes > 32000 && (S.txMax || 0) < 0.01 ? ' · ⚠️ המיקרופון לא קולט' : '')}`;
+  };
+  tick(); talkTimer = setInterval(tick, 300);
 }
-function stopTalkTimer() { clearInterval(talkTimer); talkTimer = null; $('#talkTimer').textContent = ''; }
+function stopTalkTimer() { clearInterval(talkTimer); talkTimer = null; $('#talkTimer').textContent = ''; if (S.txBytes) $('#diag').textContent = `✓ נשלחו ${Math.round(S.txBytes / 1024)}KB`; }
 
 // ============================================================ מיקום
 // חיסכון בסוללה: מעקב רגיל במצב חסכוני (רשת/WiFi), ו-GPS מדויק רק כשלוחצים לדבר
@@ -733,11 +784,13 @@ function renderLog() {
     return `<div class="item log-item">
       <div class="item-head"><b>${esc(e.name)}</b><span class="tag amber">${esc(e.channelName)}</span><span class="grow"></span><span class="muted small">${fmtTime(e.start)}</span></div>
       <div class="item-sub">משך: ${dur} · ${e.lat != null ? `📍 ${e.lat.toFixed(5)}, ${e.lng.toFixed(5)} (±${e.acc} מ׳)` : 'אין מיקום'}</div>
-      ${e.lat != null ? `<div class="item-actions"><button class="btn small" data-fly="${e.lat},${e.lng}">🗺️ הצג במפה</button>${navLinks(e.lat, e.lng)}</div>` : ''}
+      <div class="item-actions">${e.hasRec ? `<button class="btn small" data-play="${esc(e.id)}">▶ השמע</button>` : ''}${e.lat != null ? `<button class="btn small" data-fly="${e.lat},${e.lng}">🗺️ הצג במפה</button>${navLinks(e.lat, e.lng)}` : ''}</div>
     </div>`;
   }).join('') || '<div class="muted">אין שידורים עדיין</div>';
 }
 $('#logList').addEventListener('click', (e) => {
+  const pb = e.target.closest('[data-play]');
+  if (pb) { playRec(pb.dataset.play); return; }
   const b = e.target.closest('[data-fly]'); if (!b || !map) return;
   const [lat, lng] = b.dataset.fly.split(',').map(Number);
   map.flyTo([lat, lng], 17, { duration: 0.6 });
