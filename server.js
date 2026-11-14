@@ -107,6 +107,7 @@ const MIME = {
 const server = http.createServer((req, res) => {
   let p;
   try { p = decodeURIComponent((req.url || '/').split('?')[0]); } catch { res.writeHead(400); return res.end(); }
+  if (p === '/app.apk' || p === '/android') { res.writeHead(302, { Location: 'https://github.com/benyamink-live/kesherkhbos/releases/latest/download/kesher.apk' }); return res.end(); }
   if (p === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
   if (p === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });

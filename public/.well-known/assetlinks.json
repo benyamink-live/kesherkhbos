@@ -1,0 +1,8 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.kesher.app",
+    "sha256_cert_fingerprints": ["16:63:F7:DB:5F:76:9B:11:64:87:C9:38:A6:5D:E9:BD:B1:0C:55:93:03:86:76:D0:A9:25:36:1F:7C:06:05:95"]
+  }
+}]

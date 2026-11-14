@@ -1,0 +1,40 @@
+plugins { id 'com.android.application' }
+
+def appHost = System.getenv('KESHER_HOST') ?: 'kesher-ufr5.onrender.com'
+
+android {
+    namespace 'com.kesher.app'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.kesher.app'
+        minSdk 21
+        targetSdk 34
+        versionCode Integer.parseInt(System.getenv('VERSION_CODE') ?: '1')
+        versionName "1.0." + (System.getenv('VERSION_CODE') ?: '1')
+        manifestPlaceholders = [hostName: appHost, launchUrl: "https://" + appHost + "/"]
+        resValue 'string', 'asset_statements', '[{\\"relation\\": [\\"delegate_permission/common.handle_all_urls\\"], \\"target\\": {\\"namespace\\": \\"web\\", \\"site\\": \\"https://' + appHost + '\\"}}]'
+    }
+    signingConfigs {
+        release {
+            storeFile file('kesher.keystore')
+            storePassword 'kesher123'
+            keyAlias 'kesher'
+            keyPassword 'kesher123'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0'
+    implementation 'com.google.androidbrowserhelper:locationdelegation:1.1.1'
+}

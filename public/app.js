@@ -821,6 +821,12 @@ function toast(msg) {
   clearTimeout(toastT); toastT = setTimeout(() => t.classList.add('hidden'), 3500);
 }
 
+// קישור להורדת האפליקציה – רק בדפדפן באנדרואיד (לא בתוך האפליקציה עצמה)
+(function () {
+  const inApp = document.referrer.startsWith('android-app://') || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+  if (/Android/i.test(navigator.userAgent) && !inApp) $('#apkLink').classList.remove('hidden');
+})();
+
 // ============================================================ התחלה
 if (S.token) { $('#loginErr').textContent = 'מתחבר…'; }
 connect();
