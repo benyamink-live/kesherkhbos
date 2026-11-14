@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>קשר</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======================= מסך פתיחה ======================= -->
+<div id="splash"><img src="logo.png" alt="קשר"><div class="splash-bar"><span></span></div></div>
+
+<!-- ======================= התחברות ======================= -->
+<section id="login" class="screen">
+  <form id="loginForm" class="card login-card" autocomplete="on">
+    <img src="logo.png" alt="קשר" class="login-logo">
+    <p class="muted">מכשיר קשר לצוות – לחץ, דבר, שחרר</p>
+    <label>שם משתמש<input id="loginName" name="username" required maxlength="24" autocomplete="username"></label>
+    <label>סיסמה<input id="loginPass" name="password" type="password" required autocomplete="current-password"></label>
+    <button class="btn primary big" type="submit" id="loginBtn">כניסה</button>
+    <div id="loginErr" class="err"></div>
+    <p class="muted small" id="loginHint">את שם המשתמש והסיסמה מקבלים מהמנהל.</p>
+  </form>
+</section>
+
+<!-- ======================= מסך ראשי ======================= -->
+<section id="main" class="screen hidden">
+  <header class="topbar">
+    <img src="logo.png" alt="קשר" class="brand-logo">
+    <span id="connDot" class="dot off" title="חיבור לשרת"></span>
+    <span id="meName" class="me"></span>
+    <span id="roleBadge" class="badge admin hidden">מנהל</span>
+    <span class="grow"></span>
+    <button id="pushBtn" class="btn ghost small hidden" type="button">🔔 הפעל התראות</button>
+    <button id="logoutBtn" class="btn ghost small" type="button">יציאה</button>
+  </header>
+
+  <div id="layout">
+    <!-- מפה – מנהל בלבד -->
+    <div id="mapWrap" class="admin-only">
+      <div id="map"></div>
+      <div id="speakBanner" class="hidden"></div>
+      <label class="follow"><input type="checkbox" id="followChk" checked> עקוב אחרי הדובר</label>
+      <button id="fitBtn" class="btn small map-btn" type="button" title="הצג את כולם">⤢ כולם</button>
+    </div>
+
+    <aside id="panel">
+      <nav id="tabs" class="admin-only">
+        <button data-tab="talk" class="active">🎙️ דיבור</button>
+        <button data-tab="users">👥 משתמשים</button>
+        <button data-tab="channels">📡 קבוצות</button>
+        <button data-tab="alerts">🔔 התראות</button>
+        <button data-tab="log">🕘 יומן</button>
+      </nav>
+
+      <!-- דיבור -->
+      <div class="tab active" id="tab-talk">
+        <div id="noChannels" class="card notice hidden">⏳ עדיין לא חוברת לקבוצת דיבור. המנהל יחבר אותך בקרוב.</div>
+        <div id="channelChips" class="chips"></div>
+        <div id="statusBox" class="status">מוכן</div>
+        <div class="ptt-wrap">
+          <button id="pttBtn" class="ptt" type="button" aria-label="לחץ לדיבור">
+            <span class="ptt-icon">🎙️</span>
+            <span id="pttLabel">לחץ והחזק לדיבור</span>
+          </button>
+          <div id="talkTimer" class="talk-timer"></div>
+        </div>
+        <label class="row-check"><input type="checkbox" id="toggleMode"> מצב לחיצה אחת (בלי להחזיק)</label>
+        <label class="row-check"><input type="checkbox" id="wakeChk"> השאר מסך דלוק (צורך יותר סוללה)</label>
+        <div id="locStatus" class="muted small center">📍 ממתין למיקום…</div>
+        <h3>מחוברים בערוץ</h3>
+        <ul id="members" class="members"></ul>
+      </div>
+
+      <!-- משתמשים -->
+      <div class="tab admin-only" id="tab-users">
+        <form id="newUserForm" class="card alert-form">
+          <b>➕ משתמש חדש</b>
+          <div class="inline-form" style="margin:0">
+            <input id="newUserName" placeholder="שם משתמש" maxlength="24" required autocomplete="off">
+            <input id="newUserPass" placeholder="סיסמה" minlength="4" required autocomplete="new-password">
+          </div>
+          <div id="newUserChannels" class="ch-boxes"></div>
+          <button class="btn primary" type="submit">צור משתמש</button>
+        </form>
+        <div class="muted small" style="margin:10px 0">סמן קבוצות כדי לחבר משתמש. "העבר לקבוצה" מעביר אותו לשם מיד.</div>
+        <div id="usersList"></div>
+      </div>
+
+      <!-- ערוצים -->
+      <div class="tab admin-only" id="tab-channels">
+        <form id="newChannelForm" class="inline-form">
+          <input id="newChannelName" placeholder="שם קבוצה חדשה" maxlength="30" required>
+          <button class="btn primary" type="submit">➕ צור</button>
+        </form>
+        <div id="channelsList"></div>
+      </div>
+
+      <!-- התראות -->
+      <div class="tab admin-only" id="tab-alerts">
+        <form id="alertForm" class="card alert-form">
+          <label>אל<select id="alertTarget"></select></label>
+          <label>כותרת<input id="alertTitle" maxlength="80" placeholder="הודעה מהמנהל"></label>
+          <label>תוכן<textarea id="alertBody" maxlength="500" rows="3" required placeholder="מה רוצים להגיד?"></textarea></label>
+          <label class="row-check"><input type="checkbox" id="alertUrgent"> 🚨 דחוף (צליל אזעקה + רטט עד אישור)</label>
+          <button class="btn primary big" type="submit">שלח התראה</button>
+        </form>
+        <h3>התראות שנשלחו</h3>
+        <div id="alertsList"></div>
+      </div>
+
+      <!-- יומן -->
+      <div class="tab admin-only" id="tab-log">
+        <div class="row-between"><span class="muted small">יומן שידורים, כולל המיקום של הדובר בכל שידור</span><button id="clearLogBtn" class="btn ghost small" type="button">נקה</button></div>
+        <div id="logList"></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- שכבת הפעלת שמע (נדרשת נגיעה בטלפונים) -->
+<div id="unlock" class="overlay hidden">
+  <div class="card center">
+    <div class="logo">🔊</div>
+    <p>לחץ כדי להפעיל שמע ומיקרופון</p>
+    <button id="unlockBtn" class="btn primary big" type="button">הפעל</button>
+  </div>
+</div>
+
+<!-- התראה נכנסת -->
+<div id="alertOverlay" class="overlay hidden">
+  <div class="card alert-card" id="alertCard">
+    <div class="alert-icon" id="alertIcon">🔔</div>
+    <h2 id="alertTitleView"></h2>
+    <p id="alertBodyView"></p>
+    <div class="muted small" id="alertMeta"></div>
+    <button id="alertAckBtn" class="btn primary big" type="button">קיבלתי ✓</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
