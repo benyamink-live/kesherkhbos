@@ -75,9 +75,21 @@
           <div id="talkTimer" class="talk-timer"></div>
           <div id="diag" class="diag"></div>
         </div>
+        <div class="status-row">
+          <button class="chip status-chip active" data-status="available" type="button">🟢 זמין</button>
+          <button class="chip status-chip" data-status="busy" type="button">🔕 עסוק</button>
+          <button id="sosBtn" class="sos-btn" type="button"><span class="sos-fill"></span><span class="sos-txt">🆘 חירום (החזק)</span></button>
+        </div>
         <label class="row-check"><input type="checkbox" id="toggleMode"> מצב לחיצה אחת (בלי להחזיק)</label>
         <label class="row-check"><input type="checkbox" id="wakeChk"> השאר מסך דלוק (צורך יותר סוללה)</label>
         <div id="locStatus" class="muted small center">📍 ממתין למיקום…</div>
+        <h3>💬 הודעות בערוץ</h3>
+        <div id="chat" class="chat"></div>
+        <form id="chatForm" class="chat-form">
+          <label class="btn img-btn" title="שלח תמונה">📷<input type="file" id="imgInput" accept="image/*" hidden></label>
+          <input id="chatInput" placeholder="כתוב הודעה…" maxlength="1000" autocomplete="off">
+          <button class="btn primary" type="submit">שלח</button>
+        </form>
         <h3>מחוברים בערוץ</h3>
         <ul id="members" class="members"></ul>
         <h3>🕘 הקלטות אחרונות בערוץ</h3>
@@ -124,6 +136,7 @@
 
       <!-- יומן -->
       <div class="tab admin-only" id="tab-log">
+        <div id="sosLog"></div>
         <div class="row-between"><span class="muted small">יומן שידורים, כולל המיקום של הדובר בכל שידור</span><button id="clearLogBtn" class="btn ghost small" type="button">נקה</button></div>
         <div id="logList"></div>
       </div>
@@ -150,6 +163,21 @@
     <button id="alertAckBtn" class="btn primary big" type="button">קיבלתי ✓</button>
   </div>
 </div>
+
+<!-- קריאת חירום (מנהל) -->
+<div id="sosOverlay" class="overlay hidden">
+  <div class="card alert-card urgent">
+    <div class="alert-icon">🆘</div>
+    <h2 id="sosTitle"></h2>
+    <p id="sosBody"></p>
+    <div id="sosLinks" class="muted small"></div>
+    <button id="sosMapBtn" class="btn big" type="button">🗺️ הצג במפה</button>
+    <button id="sosAckBtn" class="btn primary big" type="button">ראיתי – אני מטפל ✓</button>
+  </div>
+</div>
+
+<!-- תמונה מוגדלת -->
+<div id="imgView" class="overlay hidden"><img id="imgViewImg" alt=""></div>
 
 <div id="toast" class="toast hidden"></div>
 

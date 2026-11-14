@@ -21,6 +21,7 @@ const MAX_TALK_MS = (+process.env.MAX_TALK_SEC || 60) * 1000;
 const PUSH_CONTACT = process.env.PUSH_CONTACT || 'mailto:admin@example.com';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_RECS = 10;                                   // הקלטות אחרונות לכל ערוץ
+const MAX_MSGS = 50;                                   // הודעות טקסט/תמונה אחרונות לכל ערוץ
 const MAX_REC_BYTES = Math.ceil(MAX_TALK_MS / 1000 + 2) * 32000;
 
 if (!process.env.ADMIN_PASSWORD) {
@@ -34,6 +35,8 @@ function newId(p) { return p + crypto.randomBytes(5).toString('hex'); }
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let pgPool = null;
 const recs = new Map();   // channelId -> [{ id, channel, name, start, end, lat, lng, acc, audio: Buffer }] (החדש ראשון)
+const msgs = new Map();   // channelId -> [{ id, channel, name, ts, text, hasImage, image }] (הישן ראשון)
+const sosList = [];       // קריאות חירום אחרונות
 let db = { users: {}, channels: {}, tokens: {}, vapid: null, adminLoc: null, adminPush: [], alerts: [] };
 
 async function loadDb() {
@@ -45,6 +48,13 @@ async function loadDb() {
     const r = await pgPool.query("SELECT v FROM kesher_store WHERE k = 'db'");
     if (r.rows[0]) loaded = r.rows[0].v;
     await pgPool.query('CREATE TABLE IF NOT EXISTS kesher_rec (id TEXT PRIMARY KEY, channel TEXT NOT NULL, meta JSONB NOT NULL, audio BYTEA NOT NULL, ts BIGINT NOT NULL)');
+    await pgPool.query('CREATE TABLE IF NOT EXISTS kesher_msg (id TEXT PRIMARY KEY, channel TEXT NOT NULL, meta JSONB NOT NULL, image TEXT, ts BIGINT NOT NULL)');
+    const mr = await pgPool.query('SELECT id, channel, meta, image FROM kesher_msg ORDER BY ts DESC');
+    for (const row of mr.rows) {
+      const list = msgs.get(row.channel) || [];
+      if (list.length < MAX_MSGS) list.unshift(Object.assign({}, row.meta, { id: row.id, channel: row.channel, image: row.image || null }));
+      msgs.set(row.channel, list);
+    }
     const rr = await pgPool.query('SELECT id, channel, meta, audio FROM kesher_rec ORDER BY ts DESC');
     for (const row of rr.rows) {
       const list = recs.get(row.channel) || [];
@@ -115,6 +125,8 @@ const server = http.createServer((req, res) => {
   }
   const rm = p.match(/^\/rec\/([a-z0-9]+)$/);
   if (rm) return serveRec(req, res, rm[1]);
+  const im = p.match(/^\/img\/([a-z0-9]+)$/);
+  if (im) return serveImg(req, res, im[1]);
   if (p === '/') p = '/index.html';
   const f = path.normalize(path.join(PUBLIC_DIR, p));
   if (!f.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end(); }
@@ -128,7 +140,7 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------------------------------------------------------------- WebSocket
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1536 * 1024 });
 const sessions = new Set();
 const floors = new Map(); // channelId -> { s, entry, timer, chunks, bytes, peak, sent }
 let lastTx = null;        // אבחון: נתוני השידור האחרון
@@ -145,7 +157,7 @@ function allowedChannels(s) {
 }
 
 wss.on('connection', (ws) => {
-  const s = { ws, name: null, role: null, active: null, loc: null, speaking: null, alive: true, tries: 0, token: null };
+  const s = { ws, name: null, role: null, active: null, loc: null, speaking: null, alive: true, tries: 0, token: null, status: 'available', bat: null };
   sessions.add(s);
   ws.on('pong', () => { s.alive = true; });
   ws.on('message', (data, isBinary) => {
@@ -205,6 +217,65 @@ function saveRec(f) {
   }
   for (const o of sessions) if (o.name && (o.active === e.channel || o.role === 'admin')) send(o, { t: 'recs_changed', channel: e.channel });
 }
+function msgMeta(m) { return { id: m.id, channel: m.channel, name: m.name, ts: m.ts, text: m.text || '', hasImage: !!m.image }; }
+function addMsg(s, m) {
+  const ch = s.active;
+  if (!ch || !allowedChannels(s).includes(ch)) return toast(s, 'אין ערוץ פעיל');
+  const text = String(m.text || '').trim().slice(0, 1000);
+  let image = null;
+  if (typeof m.image === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(m.image) && m.image.length <= 1400 * 1024) image = m.image;
+  if (!text && !image) return;
+  const msg = { id: newId('m'), channel: ch, name: s.name, ts: Date.now(), text, image };
+  const list = msgs.get(ch) || [];
+  list.push(msg);
+  const removed = list.splice(0, Math.max(0, list.length - MAX_MSGS));
+  msgs.set(ch, list);
+  if (pgPool) {
+    pgPool.query('INSERT INTO kesher_msg (id, channel, meta, image, ts) VALUES ($1,$2,$3,$4,$5)', [msg.id, ch, JSON.stringify({ name: msg.name, ts: msg.ts, text }), image, msg.ts])
+      .then(() => removed.length && pgPool.query('DELETE FROM kesher_msg WHERE id = ANY($1)', [removed.map(x => x.id)]))
+      .catch(err => console.error('msg save failed', err.message));
+  }
+  for (const o of sessions) if (o.name && o.active === ch) send(o, { t: 'msg', msg: msgMeta(msg) });
+}
+function findMsg(id) {
+  for (const list of msgs.values()) { const m = list.find(x => x.id === id); if (m) return m; }
+  return null;
+}
+function tokenCanSee(req, channel) {
+  const tk = db.tokens[String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')];
+  if (!tk) return null;
+  if (tk.role === 'admin') return tk;
+  const u = db.users[tk.name];
+  return u && !u.blocked && u.channels.includes(channel) ? tk : false;
+}
+function serveImg(req, res, id) {
+  const m = findMsg(id);
+  const ok = m && m.image && tokenCanSee(req, m.channel);
+  if (!ok) { res.writeHead(ok === null ? 401 : 404); return res.end(); }
+  const [, mime, b64] = m.image.match(/^data:(image\/[a-z]+);base64,(.*)$/);
+  const buf = Buffer.from(b64, 'base64');
+  res.writeHead(200, { 'Content-Type': mime, 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=86400' });
+  res.end(buf);
+}
+async function onSos(s) {
+  const loc = s.loc;
+  const e = { id: newId('s'), name: s.name, channel: s.active, channelName: s.active && db.channels[s.active] ? db.channels[s.active].name : '', ts: Date.now(),
+    lat: loc ? loc.lat : null, lng: loc ? loc.lng : null, acc: loc ? loc.acc : null, bat: s.bat, ack: null };
+  sosList.unshift(e);
+  if (sosList.length > 30) sosList.pop();
+  send(s, { t: 'sos_sent' });
+  toAdmins({ t: 'sos', sos: e });
+  // התראה דחופה לשאר חברי הערוץ
+  const where = e.lat != null ? `\nמיקום: https://www.google.com/maps?q=${e.lat},${e.lng}` : '';
+  const alert = { id: newId('a'), title: `🆘 קריאת חירום – ${s.name}`, body: `${s.name} לחץ על כפתור החירום${e.channelName ? ' בערוץ ' + e.channelName : ''}.${where}`, urgent: true, ts: e.ts, from: s.name, targetLabel: e.channelName || 'מנהל' };
+  const pushTargets = [...db.adminPush];
+  for (const o of sessions) if (o !== s && o.role === 'user' && o.active && o.active === s.active) send(o, { t: 'alert', alert });
+  if (s.active) for (const [n, u] of Object.entries(db.users)) if (n !== s.name && u.channels.includes(s.active)) pushTargets.push(...(u.push || []));
+  const payload = JSON.stringify({ title: alert.title, body: alert.body, id: alert.id, urgent: true, from: s.name, ts: e.ts });
+  await Promise.allSettled(pushTargets.map(sub => webpush.sendNotification(sub, payload, { TTL: 3600, urgency: 'high' })));
+  broadcastAll();
+}
+
 function findRec(id) {
   for (const list of recs.values()) { const r = list.find(x => x.id === id); if (r) return r; }
   return null;
@@ -220,7 +291,7 @@ function wavHeader(len) {
 function serveRec(req, res, id) {
   const auth = String(req.headers.authorization || '');
   const tk = db.tokens[auth.replace(/^Bearer\s+/i, '')];
-  const r = findRec(id);
+  const r = findRec(id); // eslint-disable-line
   const ok = tk && r && (tk.role === 'admin' || (db.users[tk.name] && !db.users[tk.name].blocked && db.users[tk.name].channels.includes(r.channel)));
   if (!tk) { res.writeHead(401); return res.end(); }
   if (!ok) { res.writeHead(404); return res.end(); }
@@ -274,13 +345,14 @@ function onMsg(s, m) {
       const lat = +m.lat, lng = +m.lng, acc = Math.round(+m.acc || 0);
       if (!isFinite(lat) || !isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return;
       s.loc = { lat, lng, acc, ts: Date.now() };
+      if (m.bat != null && isFinite(+m.bat)) s.bat = { level: Math.max(0, Math.min(100, Math.round(+m.bat))), charging: !!m.charging };
       if (s.role === 'user' && db.users[s.name]) db.users[s.name].lastLoc = s.loc; else db.adminLoc = s.loc;
       saveLocSoon();
       if (s.speaking) {
         const f = floors.get(s.speaking);
         if (f) Object.assign(f.entry, { lat, lng, acc });
       }
-      return toAdmins({ t: 'loc', name: s.name, loc: s.loc, speaking: s.speaking });
+      return toAdmins({ t: 'loc', name: s.name, loc: s.loc, speaking: s.speaking, bat: s.bat });
     }
     case 'ptt_start': {
       const ch = s.active;
@@ -315,6 +387,17 @@ function onMsg(s, m) {
       if (!list.some(p => p.endpoint === sub.endpoint)) list.push({ endpoint: sub.endpoint, keys: sub.keys });
       if (list.length > 5) list.splice(0, list.length - 5);
       save();
+      return broadcastAll();
+    }
+    case 'msg': return addMsg(s, m);
+    case 'msgs': {
+      const ch = m.channel;
+      if (!ch || !allowedChannels(s).includes(ch)) return;
+      return send(s, { t: 'msgs', channel: ch, list: (msgs.get(ch) || []).map(msgMeta) });
+    }
+    case 'sos': return onSos(s);
+    case 'status': {
+      s.status = m.status === 'busy' ? 'busy' : 'available';
       return broadcastAll();
     }
     case 'recs': {
@@ -502,6 +585,8 @@ function adminOp(s, m) {
       releaseFloor(m.id);
       delete db.channels[m.id];
       recs.delete(m.id);
+      msgs.delete(m.id);
+      if (pgPool) pgPool.query('DELETE FROM kesher_msg WHERE channel = $1', [m.id]).catch(() => {});
       if (pgPool) pgPool.query('DELETE FROM kesher_rec WHERE channel = $1', [m.id]).catch(() => {});
       for (const x of Object.values(db.users)) x.channels = x.channels.filter(c => c !== m.id);
       for (const o of sessions) if (o.active === m.id) o.active = allowedChannels(o)[0] || null;
@@ -561,6 +646,13 @@ function adminOp(s, m) {
     case 'delete_alert':
       db.alerts = db.alerts.filter(a => a.id !== m.id);
       break;
+    case 'sos_ack': {
+      const e = sosList.find(x => x.id === m.id);
+      if (!e || e.ack) return;
+      e.ack = Date.now();
+      for (const o of sessions) if (o.name === e.name) toast(o, '✅ המנהל קיבל את קריאת החירום שלך');
+      break;
+    }
     case 'clear_log':
       log.length = 0;
       break;
@@ -577,7 +669,7 @@ function sendMe(s) {
   if (s.active && !allowed.includes(s.active)) s.active = null;
   if (s.role === 'admin') db.adminActive = s.active;
   const channels = allowed.map(id => ({ id, name: db.channels[id].name, speaking: floors.has(id) ? floors.get(id).s.name : null }));
-  const members = s.active ? [...sessions].filter(o => o.name && o.active === s.active).map(o => ({ name: o.name, role: o.role })) : [];
+  const members = s.active ? [...sessions].filter(o => o.name && o.active === s.active).map(o => ({ name: o.name, role: o.role, status: o.status })) : [];
   const hasPush = s.role === 'admin' ? db.adminPush.length > 0 : !!(db.users[s.name] && (db.users[s.name].push || []).length);
   send(s, { t: 'me', channels, active: s.active, members, speaking: s.active && floors.has(s.active) ? floors.get(s.active).s.name : null, hasPush });
 }
@@ -587,10 +679,10 @@ function buildState() {
   for (const o of sessions) if (o.name) online.set(o.name, o);
   const users = [];
   const ad = online.get(ADMIN_USER);
-  users.push({ name: ADMIN_USER, role: 'admin', online: !!ad, active: ad ? ad.active : null, channels: Object.keys(db.channels), blocked: false, loc: (ad && ad.loc) || db.adminLoc || null, speaking: ad ? ad.speaking : null, push: db.adminPush.length });
+  users.push({ name: ADMIN_USER, role: 'admin', online: !!ad, active: ad ? ad.active : null, channels: Object.keys(db.channels), blocked: false, loc: (ad && ad.loc) || db.adminLoc || null, speaking: ad ? ad.speaking : null, push: db.adminPush.length, status: ad ? ad.status : null, bat: ad ? ad.bat : null });
   for (const [name, u] of Object.entries(db.users)) {
     const o = online.get(name);
-    users.push({ name, role: 'user', online: !!o, active: o ? o.active : null, channels: u.channels.filter(c => db.channels[c]), blocked: !!u.blocked, loc: (o && o.loc) || u.lastLoc || null, speaking: o ? o.speaking : null, created: u.created, push: (u.push || []).length });
+    users.push({ name, role: 'user', online: !!o, active: o ? o.active : null, channels: u.channels.filter(c => db.channels[c]), blocked: !!u.blocked, loc: (o && o.loc) || u.lastLoc || null, speaking: o ? o.speaking : null, created: u.created, push: (u.push || []).length, status: o ? o.status : null, bat: o ? o.bat : null });
   }
   users.sort((a, b) => (a.role === 'admin' ? -1 : b.role === 'admin' ? 1 : 0) || (b.online - a.online) || a.name.localeCompare(b.name, 'he'));
   const channels = Object.entries(db.channels).map(([id, c]) => ({
@@ -600,7 +692,7 @@ function buildState() {
     assigned: Object.values(db.users).filter(x => x.channels.includes(id)).length,
   }));
   const alerts = db.alerts.slice(0, 50).map(a => ({ ...publicAlert(a), total: alertTargets(a).length, acks: Object.keys(a.acks).length, ackNames: Object.keys(a.acks), stats: a.stats }));
-  return { t: 'state', users, channels, log: log.slice(0, 150), alerts };
+  return { t: 'state', users, channels, log: log.slice(0, 150), alerts, sos: sosList };
 }
 
 function broadcastAll() {

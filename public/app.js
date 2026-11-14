@@ -11,6 +11,7 @@ const S = {
   state: null, live: new Map(), vapid: null,
   pendingAuth: null, stopReconnect: false, reconnectDelay: 1000,
   alertQueue: [], currentAlert: null,
+  status: localStorage.getItem('ptt_status') || 'available', msgs: [], bat: null,
 };
 
 // ============================================================ שמע
@@ -117,6 +118,7 @@ function flushMic() {
 
 function playChunk(ab) {
   if (!A.ctx || A.ctx.state === 'closed' || ab.byteLength < 2) return;
+  if (S.status === 'busy') { S.rxBytes = (S.rxBytes || 0) + ab.byteLength; return; } // עסוק: נשמר בהקלטות בלבד
   if (A.ctx.state !== 'running') ctxWake();
   const i16 = new Int16Array(ab, 0, ab.byteLength >> 1);
   S.rxBytes = (S.rxBytes || 0) + ab.byteLength;
@@ -183,6 +185,8 @@ function handle(m) {
   switch (m.t) {
     case 'hello': S.vapid = m.vapidPublicKey; $('#loginHint').textContent = m.allowRegister ? 'משתמש חדש? הכנס שם וסיסמה – החשבון ייפתח אוטומטית.' : 'את שם המשתמש והסיסמה מקבלים מהמנהל.'; break;
     case 'auth_ok':
+      if (S.status !== 'available') setTimeout(() => send({ t: 'status', status: S.status }), 50);
+      S.recsCh = undefined;
       S.authed = true; S.pendingAuth = null; S.me = m.name; S.role = m.role; S.maxTalk = m.maxTalk || 60;
       S.token = m.token; localStorage.setItem('ptt_token', m.token);
       showMain();
@@ -202,7 +206,7 @@ function handle(m) {
       if (S.speaking !== m.speaking) A.nextTime = 0;
       S.speaking = m.speaking;
       renderTalk();
-      if (S.recsCh !== S.active) { S.recsCh = S.active; S.recs = []; renderRecs(); requestRecs(); }
+      if (S.recsCh !== S.active) { S.recsCh = S.active; S.recs = []; S.msgs = []; renderRecs(); renderChat(); requestRecs(); if (S.active) send({ t: 'msgs', channel: S.active }); }
       renderPushBtn();
       break;
     case 'floor':
@@ -225,6 +229,15 @@ function handle(m) {
       break;
     case 'toast': toast(m.msg); break;
     case 'recs': if (m.channel === S.active) { S.recs = m.list; renderRecs(); } break;
+    case 'msgs': if (m.channel === S.active) { S.msgs = m.list; renderChat(true); } break;
+    case 'msg':
+      if (m.msg.channel === S.active) {
+        S.msgs.push(m.msg); if (S.msgs.length > 50) S.msgs.shift(); renderChat(true);
+        if (m.msg.name !== S.me) { beep(1320, 0.05, 0.08); if (navigator.vibrate) navigator.vibrate(60); }
+      }
+      break;
+    case 'sos_sent': toast('🆘 קריאת החירום נשלחה למנהל ולחברי הערוץ, יחד עם המיקום שלך'); if (navigator.vibrate) navigator.vibrate([300, 100, 300]); break;
+    case 'sos': onSosAdmin(m.sos); break;
     case 'recs_changed': if (m.channel === S.active) requestRecs(); break;
     case 'alert': queueAlert(m.alert); break;
     // ---- מנהל
@@ -296,7 +309,7 @@ function renderTalk() {
   else if (!S.active) { st.className = 'status'; st.textContent = 'לא נבחר ערוץ'; }
   else { st.className = 'status'; st.textContent = 'ערוץ: ' + ((S.channels.find((c) => c.id === S.active) || {}).name || ''); }
   $('#members').innerHTML = S.members.length
-    ? S.members.map((u) => `<li class="${u.name === S.speaking ? 'speaking' : ''}"><span class="dot on"></span>${esc(u.name)}${u.role === 'admin' ? ' <span class="badge admin">מנהל</span>' : ''}${u.name === S.speaking ? ' 🔊' : ''}${u.name === S.me ? ' <span class="muted small">(אתה)</span>' : ''}</li>`).join('')
+    ? S.members.map((u) => `<li class="${u.name === S.speaking ? 'speaking' : ''}"><span class="dot on"></span>${esc(u.name)}${u.status === 'busy' ? ' <span class="tag">🔕 עסוק</span>' : ''}${u.role === 'admin' ? ' <span class="badge admin">מנהל</span>' : ''}${u.name === S.speaking ? ' 🔊' : ''}${u.name === S.me ? ' <span class="muted small">(אתה)</span>' : ''}</li>`).join('')
     : '<li class="muted">אין מחוברים</li>';
   renderPtt();
 }
@@ -376,6 +389,118 @@ $('#testSoundBtn').addEventListener('click', async () => {
   toast(A.ctx && A.ctx.state === 'running' ? '🔊 אם שמעת 3 צפצופים – הרמקול תקין' : '⚠️ השמע חסום – נסה ללחוץ שוב');
 });
 
+// ---- סוללה (לתצוגה אצל המנהל)
+if (navigator.getBattery) navigator.getBattery().then((b) => {
+  const upd = () => { S.bat = { level: Math.round(b.level * 100), charging: b.charging }; };
+  upd(); b.addEventListener('levelchange', upd); b.addEventListener('chargingchange', upd);
+}).catch(() => {});
+
+// ---- סטטוס: זמין / עסוק
+function renderStatus() { document.querySelectorAll('.status-chip').forEach((c) => c.classList.toggle('active', c.dataset.status === S.status)); }
+document.querySelectorAll('.status-chip').forEach((c) => c.addEventListener('click', () => {
+  S.status = c.dataset.status; localStorage.setItem('ptt_status', S.status);
+  send({ t: 'status', status: S.status }); renderStatus();
+  toast(S.status === 'busy' ? '🔕 עסוק: שידורים לא יושמעו בזמן אמת. אפשר לשמוע אותם ב"הקלטות אחרונות"' : '🟢 זמין: שידורים יושמעו בזמן אמת');
+}));
+renderStatus();
+
+// ---- כפתור חירום (החזקה של 2 שניות)
+(function () {
+  const b = $('#sosBtn'); let t = null;
+  const start = (e) => { e.preventDefault(); b.classList.add('holding'); if (navigator.vibrate) navigator.vibrate(40); t = setTimeout(() => { b.classList.remove('holding'); t = null; sendLocNow(true); preciseFix(); send({ t: 'sos' }); }, 2000); };
+  const cancel = () => { if (t) { clearTimeout(t); t = null; } b.classList.remove('holding'); };
+  b.addEventListener('pointerdown', start);
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => b.addEventListener(ev, cancel));
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+
+// ---- הודעות טקסט ותמונות בערוץ
+const imgCache = new Map();
+async function loadImg(id) {
+  if (imgCache.has(id)) return imgCache.get(id);
+  const res = await fetch('img/' + encodeURIComponent(id), { headers: { Authorization: 'Bearer ' + S.token } });
+  if (!res.ok) throw new Error(res.status);
+  const url = URL.createObjectURL(await res.blob());
+  imgCache.set(id, url); return url;
+}
+function renderChat(scroll) {
+  const el = $('#chat');
+  el.innerHTML = S.msgs.length ? S.msgs.map((m) => `
+    <div class="bubble ${m.name === S.me ? 'me' : ''}">
+      <div class="who">${esc(m.name)} <small>${fmtTime(m.ts)}</small></div>
+      ${m.text ? `<div class="txt">${esc(m.text)}</div>` : ''}
+      ${m.hasImage ? `<img data-img="${esc(m.id)}" alt="תמונה">` : ''}
+    </div>`).join('') : '<div class="muted small">אין עדיין הודעות בערוץ הזה</div>';
+  el.querySelectorAll('img[data-img]').forEach((img) => loadImg(img.dataset.img).then((u) => { img.src = u; }).catch(() => { img.alt = 'התמונה לא זמינה'; }));
+  if (scroll) el.scrollTop = el.scrollHeight;
+}
+$('#chatForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = $('#chatInput').value.trim();
+  if (!text) return;
+  if (!S.active) return toast('לא נבחר ערוץ');
+  send({ t: 'msg', text }); $('#chatInput').value = '';
+});
+function shrinkImage(file, max = 1280, q = 0.75) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src); resolve(c.toDataURL('image/jpeg', q));
+    };
+    img.onerror = reject; img.src = URL.createObjectURL(file);
+  });
+}
+$('#imgInput').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  if (!S.active) return toast('לא נבחר ערוץ');
+  try {
+    let data = await shrinkImage(f);
+    if (data.length > 1300 * 1024) data = await shrinkImage(f, 900, 0.6);
+    send({ t: 'msg', image: data, text: $('#chatInput').value.trim() }); $('#chatInput').value = '';
+    toast('📷 התמונה נשלחה');
+  } catch { toast('לא ניתן לשלוח את התמונה'); }
+});
+$('#chat').addEventListener('click', (e) => { const i = e.target.closest('img[data-img]'); if (i && i.src) { $('#imgViewImg').src = i.src; $('#imgView').classList.remove('hidden'); } });
+$('#imgView').addEventListener('click', () => $('#imgView').classList.add('hidden'));
+
+// ---- קריאות חירום אצל המנהל
+let sosCurrent = null;
+function onSosAdmin(e) {
+  if (S.state) { S.state.sos = [e, ...(S.state.sos || []).filter((x) => x.id !== e.id)]; renderSosLog(); }
+  sosCurrent = e;
+  $('#sosTitle').textContent = `${e.name} לחץ על כפתור החירום!`;
+  $('#sosBody').textContent = `${e.channelName ? 'ערוץ: ' + e.channelName + ' · ' : ''}${fmtTime(e.ts)}${e.bat ? ' · 🔋' + e.bat.level + '%' : ''}`;
+  $('#sosLinks').innerHTML = e.lat != null ? `📍 ${e.lat.toFixed(5)}, ${e.lng.toFixed(5)} (±${e.acc} מ׳)<br>${navLinks(e.lat, e.lng)}` : 'אין מיקום ידוע';
+  $('#sosOverlay').classList.remove('hidden');
+  startAlarm(true);
+  if (e.lat != null && map) map.flyTo([e.lat, e.lng], 17, { duration: 0.8 });
+}
+$('#sosMapBtn').onclick = () => {
+  $('#sosOverlay').classList.add('hidden'); stopAlarm();
+  if (sosCurrent && sosCurrent.lat != null && map) { map.flyTo([sosCurrent.lat, sosCurrent.lng], 17); L.popup().setLatLng([sosCurrent.lat, sosCurrent.lng]).setContent('🆘 ' + esc(sosCurrent.name)).openOn(map); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+};
+$('#sosAckBtn').onclick = () => {
+  if (sosCurrent) admin('sos_ack', { id: sosCurrent.id });
+  $('#sosOverlay').classList.add('hidden'); stopAlarm();
+};
+function renderSosLog() {
+  const list = (S.state && S.state.sos) || [];
+  $('#sosLog').innerHTML = list.slice(0, 10).map((e) => `
+    <div class="item sos-item">
+      <div class="item-head">🆘 <b>${esc(e.name)}</b><span class="grow"></span><span class="muted small">${fmtTime(e.ts)}</span></div>
+      <div class="item-sub">${e.channelName ? 'ערוץ ' + esc(e.channelName) + ' · ' : ''}${e.ack ? '✅ טופל' : '⏳ ממתין לטיפול'}${e.bat ? ' · 🔋' + e.bat.level + '%' : ''}</div>
+      ${e.lat != null ? `<div class="item-actions"><button class="btn small" data-fly="${e.lat},${e.lng}">🗺️ הצג במפה</button>${navLinks(e.lat, e.lng)}</div>` : ''}
+    </div>`).join('');
+}
+$('#sosLog').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-fly]'); if (!b || !map) return;
+  const [lat, lng] = b.dataset.fly.split(',').map(Number); map.flyTo([lat, lng], 17); window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
 const ptt = $('#pttBtn');
 ptt.addEventListener('pointerdown', (e) => {
   e.preventDefault();
@@ -431,7 +556,7 @@ function preciseFix() {
 function sendLocNow(force) {
   if (!S.loc || !S.authed) return;
   if (!force && Date.now() - S.lastLocSent < 1000) return;
-  send({ t: 'loc', lat: S.loc.lat, lng: S.loc.lng, acc: S.loc.acc });
+  send({ t: 'loc', lat: S.loc.lat, lng: S.loc.lng, acc: S.loc.acc, bat: S.bat ? S.bat.level : null, charging: S.bat ? S.bat.charging : false });
   S.lastLocSent = Date.now();
 }
 setInterval(() => sendLocNow(), 60000);
@@ -542,7 +667,7 @@ function pinHtml(u) {
 }
 function popupHtml(u) {
   const l = u.loc;
-  return `<b>${esc(u.name)}</b>${u.role === 'admin' ? ' (מנהל)' : ''}<br>${u.online ? '🟢 מחובר' : '⚪ לא מחובר'}${u.active ? ' · ערוץ ' + esc(chName(u.active)) : ''}<br>` +
+  return `<b>${esc(u.name)}</b>${u.role === 'admin' ? ' (מנהל)' : ''}<br>${u.online ? '🟢 מחובר' : '⚪ לא מחובר'}${u.active ? ' · ערוץ ' + esc(chName(u.active)) : ''}${u.online && u.bat ? ' · ' + (u.bat.charging ? '⚡' : '🔋') + u.bat.level + '%' : ''}${u.online && u.status === 'busy' ? ' · 🔕 עסוק' : ''}<br>` +
     (l ? `עודכן ${ago(l.ts)} · דיוק ±${l.acc} מ׳<br>${navLinks(l.lat, l.lng)}` : 'אין מיקום');
 }
 function upsertMarker(u) {
@@ -577,7 +702,7 @@ function onAdminLoc(m) {
   if (!S.state) return;
   const u = S.state.users.find((x) => x.name === m.name);
   if (!u) return;
-  u.loc = m.loc; u.online = true;
+  u.loc = m.loc; u.online = true; if (m.bat) u.bat = m.bat;
   upsertMarker(u);
   const live = S.live.get(m.name);
   if (live) {
@@ -631,7 +756,7 @@ function renderAdmin() {
   if (S.role !== 'admin' || !S.state) return;
   // סינכרון דוברים חיים מתוך המצב
   for (const e of S.state.log) if (!e.end) S.live.set(e.name, e); else if (S.live.get(e.name) && S.live.get(e.name).id === e.id) S.live.delete(e.name);
-  renderUsers(); renderNewUserChannels(); renderChannels(); renderAlerts(); renderLog(); syncMarkers(); renderBanner();
+  renderUsers(); renderNewUserChannels(); renderChannels(); renderAlerts(); renderLog(); renderSosLog(); syncMarkers(); renderBanner();
 }
 
 function renderUsers() {
@@ -655,6 +780,8 @@ function renderUsers() {
         ${isAdm ? '<span class="badge admin">מנהל</span>' : ''}
         ${u.blocked ? '<span class="tag red">חסום</span>' : ''}
         ${u.speaking ? '<span class="tag red">🔊 מדבר</span>' : ''}
+        ${u.online && u.status === 'busy' ? '<span class="tag">🔕 עסוק</span>' : ''}
+        ${u.online && u.bat ? `<span class="tag bat ${u.bat.level <= 20 && !u.bat.charging ? 'low' : ''}">${u.bat.charging ? '⚡' : '🔋'}${u.bat.level}%</span>` : ''}
         ${!isAdm ? (u.push ? '<span class="tag green">🔔 פוש</span>' : '<span class="tag">ללא פוש</span>') : ''}
         <span class="grow"></span>
         ${u.loc ? `<button class="btn small" data-act="locate" data-user="${esc(u.name)}">🗺️</button>` : ''}
